@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=COSMIC Caps Lock Indicator
+Comment=Shows whether Caps Lock is on or off in the top panel
+Exec=/home/mike/.local/bin/cosmic-caps-lock-indicator
+Icon=caps-lock-badge-on-symbolic
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

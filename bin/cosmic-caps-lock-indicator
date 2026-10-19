@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+COSMIC Caps Lock Indicator
+Shows whether Caps Lock is active or inactive in the COSMIC top panel.
+Designed for Pop!_OS and the COSMIC Desktop Environment.
+"""
+
+import os
+import sys
+import glob
+import json
+import signal
+import fcntl
+import subprocess
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('AyatanaAppIndicator3', '0.1')
+try:
+    gi.require_version('Notify', '0.7')
+    from gi.repository import Notify
+    HAS_NOTIFY = True
+except Exception:
+    HAS_NOTIFY = False
+
+from gi.repository import Gtk, AyatanaAppIndicator3, GLib
+
+CONFIG_DIR = os.path.expanduser('~/.config/cosmic-caps-lock-indicator')
+CONFIG_PATH = os.path.join(CONFIG_DIR, 'config.json')
+LOCK_PATH = f'/tmp/cosmic-caps-lock-indicator-{os.getuid()}.lock'
+
+# Discover icon directory (support both installed and git repo dev runs)
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+DEV_ICON_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'icons', 'scalable'))
+INSTALLED_ICON_DIR = os.path.expanduser('~/.local/share/cosmic-caps-lock-indicator/icons')
+
+if os.path.isdir(INSTALLED_ICON_DIR):
+    ICON_DIR = INSTALLED_ICON_DIR
+elif os.path.isdir(DEV_ICON_DIR):
+    ICON_DIR = DEV_ICON_DIR
+else:
+    ICON_DIR = os.path.expanduser('~/.local/share/icons/hicolor/scalable/status')
+
+DEFAULT_CONFIG = {
+    'icon_style': 'badge',       # 'badge' or 'arrow'
+    'hide_when_inactive': False, # Hide indicator from top panel when Caps Lock is OFF
+    'notify_on_change': False,   # Send desktop toast notification when Caps Lock changes
+    'check_interval_ms': 100     # Polling interval in milliseconds
+}
+
+class CapsLockIndicator:
+    def __init__(self):
+        self.config = self.load_config()
+        self.last_state = None
+        self.lock_file = None
+        self._ensure_single_instance()
+
+        if HAS_NOTIFY:
+            try:
+                Notify.init('cosmic-caps-lock-indicator')
+            except Exception as e:
+                print(f'Warning: Failed to init Notify: {e}', file=sys.stderr)
+
+        self.indicator = AyatanaAppIndicator3.Indicator.new_with_path(
+            'cosmic-caps-lock-indicator',
+            self.get_icon_name(False),
+            AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+            ICON_DIR
+        )
+        self.indicator.set_title('Caps Lock')
+
+        self.build_menu()
+        self.update_state(initial=True)
+
+        interval = max(50, min(1000, self.config.get('check_interval_ms', 100)))
+        GLib.timeout_add(interval, self.poll_caps_lock)
+
+    def _ensure_single_instance(self):
+        try:
+            self.lock_file = open(LOCK_PATH, 'w')
+            fcntl.lockf(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (IOError, BlockingIOError):
+            print('Another instance of cosmic-caps-lock-indicator is already running.', file=sys.stderr)
+            sys.exit(0)
+
+    def load_config(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, 'r') as f:
+                    cfg = json.load(f)
+                    merged = dict(DEFAULT_CONFIG)
+                    merged.update(cfg)
+                    return merged
+            except Exception as e:
+                print(f'Error reading config: {e}', file=sys.stderr)
+        return dict(DEFAULT_CONFIG)
+
+    def save_config(self):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(CONFIG_PATH, 'w') as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            print(f'Error saving config: {e}', file=sys.stderr)
+
+    def get_icon_name(self, is_active):
+        style = self.config.get('icon_style', 'badge')
+        state = 'on' if is_active else 'off'
+        return f'caps-lock-{style}-{state}-symbolic'
+
+    def read_caps_lock_state(self):
+        # 1. Primary: Check sysfs LED devices (direct kernel state, ~100us)
+        led_files = (
+            glob.glob('/sys/class/leds/*capslock*/brightness') +
+            glob.glob('/sys/class/leds/*caps_lock*/brightness')
+        )
+        if led_files:
+            for p in led_files:
+                try:
+                    with open(p, 'r') as f:
+                        val = f.read().strip()
+                        if val not in ('0', ''):
+                            return True
+                except OSError:
+                    pass
+            return False
+
+        # 2. Fallback: Query XKB state via xset
+        try:
+            out = subprocess.check_output(
+                ['xset', 'q'],
+                timeout=0.1,
+                stderr=subprocess.DEVNULL
+            ).decode()
+            for line in out.splitlines():
+                if 'Caps Lock:' in line:
+                    parts = line.split('Caps Lock:')[1].split()
+                    if parts and parts[0].lower() == 'on':
+                        return True
+                    return False
+        except Exception:
+            pass
+
+        return False
+
+    def build_menu(self):
+        self.menu = Gtk.Menu()
+
+        # Status item (Header)
+        self.status_item = Gtk.MenuItem(label='Caps Lock: OFF')
+        self.status_item.set_sensitive(False)
+        self.menu.append(self.status_item)
+
+        sep1 = Gtk.SeparatorMenuItem()
+        self.menu.append(sep1)
+
+        # Hide when inactive
+        self.hide_item = Gtk.CheckMenuItem(label='Hide when inactive')
+        self.hide_item.set_active(self.config.get('hide_when_inactive', False))
+        self.hide_item.connect('toggled', self.on_toggle_hide_inactive)
+        self.menu.append(self.hide_item)
+
+        # Notify on change
+        if HAS_NOTIFY:
+            self.notify_item = Gtk.CheckMenuItem(label='Desktop notification on change')
+            self.notify_item.set_active(self.config.get('notify_on_change', False))
+            self.notify_item.connect('toggled', self.on_toggle_notify)
+            self.menu.append(self.notify_item)
+
+        # Style Submenu
+        style_item = Gtk.MenuItem(label='Icon Style')
+        style_menu = Gtk.Menu()
+        style_item.set_submenu(style_menu)
+
+        curr_style = self.config.get('icon_style', 'badge')
+        self.style_badge = Gtk.RadioMenuItem(label='Key Badge [A]')
+        self.style_arrow = Gtk.RadioMenuItem.new_with_label_from_widget(self.style_badge, 'Arrow Symbol [⇪]')
+
+        if curr_style == 'arrow':
+            self.style_arrow.set_active(True)
+        else:
+            self.style_badge.set_active(True)
+
+        self.style_badge.connect('toggled', self.on_style_changed, 'badge')
+        self.style_arrow.connect('toggled', self.on_style_changed, 'arrow')
+
+        style_menu.append(self.style_badge)
+        style_menu.append(self.style_arrow)
+        self.menu.append(style_item)
+
+        sep2 = Gtk.SeparatorMenuItem()
+        self.menu.append(sep2)
+
+        # Quit
+        quit_item = Gtk.MenuItem(label='Quit')
+        quit_item.connect('activate', lambda _: self.quit())
+        self.menu.append(quit_item)
+
+        self.menu.show_all()
+        self.indicator.set_menu(self.menu)
+
+    def on_toggle_hide_inactive(self, widget):
+        self.config['hide_when_inactive'] = widget.get_active()
+        self.save_config()
+        self.update_indicator_display(self.last_state if self.last_state is not None else False)
+
+    def on_toggle_notify(self, widget):
+        self.config['notify_on_change'] = widget.get_active()
+        self.save_config()
+
+    def on_style_changed(self, widget, style_name):
+        if widget.get_active():
+            self.config['icon_style'] = style_name
+            self.save_config()
+            self.update_indicator_display(self.last_state if self.last_state is not None else False)
+
+    def update_indicator_display(self, is_active):
+        icon_name = self.get_icon_name(is_active)
+        self.indicator.set_icon_full(icon_name, f'Caps Lock is {"ON" if is_active else "OFF"}')
+
+        if self.config.get('hide_when_inactive', False) and not is_active:
+            self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.PASSIVE)
+        else:
+            self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+
+        self.status_item.set_label(f'Caps Lock: {"ON" if is_active else "OFF"}')
+
+    def show_notification(self, is_active):
+        if not HAS_NOTIFY or not self.config.get('notify_on_change', False):
+            return
+        title = 'Caps Lock ON' if is_active else 'Caps Lock OFF'
+        body = 'Capital letters active' if is_active else 'Lowercase active'
+        icon = self.get_icon_name(is_active)
+        try:
+            n = Notify.Notification.new(title, body, icon)
+            n.set_urgency(Notify.Urgency.LOW)
+            n.set_timeout(1500)
+            n.show()
+        except Exception as e:
+            print(f'Notification error: {e}', file=sys.stderr)
+
+    def update_state(self, initial=False):
+        current_state = self.read_caps_lock_state()
+        if initial or current_state != self.last_state:
+            self.last_state = current_state
+            self.update_indicator_display(current_state)
+            if not initial:
+                self.show_notification(current_state)
+
+    def poll_caps_lock(self):
+        try:
+            self.update_state(initial=False)
+        except Exception as e:
+            print(f'Poll error: {e}', file=sys.stderr)
+        return True
+
+    def quit(self):
+        if self.lock_file:
+            try:
+                fcntl.lockf(self.lock_file, fcntl.LOCK_UN)
+                self.lock_file.close()
+                if os.path.exists(LOCK_PATH):
+                    os.unlink(LOCK_PATH)
+            except Exception:
+                pass
+        Gtk.main_quit()
+
+def main():
+    signal.signal(signal.SIGINT, lambda *_: Gtk.main_quit())
+    signal.signal(signal.SIGTERM, lambda *_: Gtk.main_quit())
+
+    app = CapsLockIndicator()
+    Gtk.main()
+
+if __name__ == '__main__':
+    main()

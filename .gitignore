@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.lock
+.DS_Store
+.vscode/
+config.json
