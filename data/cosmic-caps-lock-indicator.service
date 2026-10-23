@@ -4,7 +4,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/home/mike/.local/bin/cosmic-caps-lock-indicator
+ExecStart=%h/.local/bin/cosmic-caps-lock-indicator
 Restart=on-failure
 RestartSec=3
 
